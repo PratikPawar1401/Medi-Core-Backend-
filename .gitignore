@@ -1,0 +1,6 @@
+.env
+venv
+uploads
+__pycache__/
+vector_store.pkl
+medical_triage.db
