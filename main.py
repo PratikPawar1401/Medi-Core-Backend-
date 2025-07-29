@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from datetime import timedelta
 from dotenv import load_dotenv
@@ -27,6 +28,14 @@ from chatbot import router as chatbot_router
 load_dotenv()
 
 app = FastAPI(title="FastAPI Medical Triage Backend with Database", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Adjust this in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)

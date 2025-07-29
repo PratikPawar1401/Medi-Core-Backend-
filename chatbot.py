@@ -20,7 +20,7 @@ from auth.auth_handler import get_current_active_user
 from fastapi import Depends
 from rag_system import rag_system
 from langchain_core.documents import Document
-
+import aiofiles 
 
 load_dotenv()
 
@@ -36,12 +36,14 @@ genai.configure(api_key=api_key)
 model = genai.GenerativeModel("gemini-2.0-flash-exp")
 
 # Global vector store
+vector_store = rag_system.vector_store
 VECTOR_STORE_PATH = "vector_store.pkl"
 if os.path.exists(VECTOR_STORE_PATH):
     with open(VECTOR_STORE_PATH, "rb") as f:
         vector_store = pickle.load(f)
 else:
     vector_store = None
+
 
 # Medical triage stages
 class TriageStage(Enum):
@@ -89,7 +91,7 @@ class MedicalKnowledgeBase:
 
 
 
-kb = MedicalKnowledgeBase(rag_system.vector_store, user_id=None)  
+
 
 # Request/Response models
 class ChatRequest(BaseModel):
@@ -130,8 +132,10 @@ async def medical_triage(
     """Complete medical triage conversation following clinical protocols with database storage."""
     
     sess_id = req.session_id or str(uuid4())
-    
+    session = triage_sessions.get(sess_id, TriageSession())
+    triage_sessions[sess_id] = session
     session.data["user_id"] = current_user.id
+
     # Get or create database session
     db_session = db.query(DBChatSession).filter(DBChatSession.session_id == sess_id).first()
     if not db_session:
@@ -622,9 +626,9 @@ async def ask_bot(
     prompt: str = Form(...),
     current_user: DBUser = Depends(get_current_active_user)
 ):
-    if vector_store is None:
+    if rag_system.vector_store is None:
         raise HTTPException(400, "Knowledge base not ready; upload PDFs first.")
-    kb = MedicalKnowledgeBase(vector_store, user_id=current_user.id)
+    kb = MedicalKnowledgeBase(rag_system.vector_store, user_id=current_user.id)
     context = kb.get_context(prompt, k=3)
     custom_prompt = (
         "You are the best doctor. Use the following documents to answer precisely.\n"
@@ -633,26 +637,93 @@ async def ask_bot(
     resp = model.generate_content(custom_prompt)
     return resp.text or "No answer from model"
 
+
 # Simple chat endpoint (existing functionality)
-@router.post("/chat", response_model=ChatResponse)
-async def simple_chat(
-    req: ChatRequest,
-    current_user: DBUser = Depends(get_current_active_user)
+@router.post("/chat")
+async def chat_and_upload(
+    files: Optional[List[UploadFile]] = File(None),
+    query: Optional[str] = Form(None),
+    current_user: DBUser = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
 ):
-    sess_id = req.session_id or str(uuid4())
-    kb = MedicalKnowledgeBase(vector_store, user_id=current_user.id)
-    context = kb.get_context(req.message, k=2)
-    prompt = (
-        "You are a helpful medical assistant. Base your answer on the context below.\n\n"
-        f"Context: {context}\n\nQuestion: {req.message}\n\n"
-        "Always remind users to consult healthcare professionals for serious concerns."
-    )
-    response = model.generate_content(prompt)
-    return ChatResponse(
-        session_id=sess_id,
-        reply=response.text.strip(),
-        finished=True,
-        stage="simple_chat",
-        progress="Complete",
-        extracted_info={"context_provided": bool(context)}
-    )
+    upload_results = []
+    answer = None
+    sources = []
+
+    # Handle file uploads if present
+    if files:
+        uploads_folder = "uploads"
+        os.makedirs(uploads_folder, exist_ok=True)
+
+        for file in files:
+            ext = file.filename.split(".")[-1].lower()
+            if ext not in ('pdf', 'docx', 'doc', 'txt', 'xlsx', 'xls'):
+                upload_results.append({
+                    "filename": file.filename,
+                    "status": "error",
+                    "message": "Unsupported file type"
+                })
+                continue
+
+            file_path = os.path.join(uploads_folder, f"{current_user.id}_{file.filename}")
+            async with aiofiles.open(file_path, 'wb') as out_file:
+                content = await file.read()
+                await out_file.write(content)
+
+            result = await rag_system.process_uploaded_file(file_path, ext, current_user.id, db)
+            result["filename"] = file.filename
+            upload_results.append(result)
+
+    # Handle chatbot query if present
+    if query:
+        if not query.strip():
+            raise HTTPException(status_code=400, detail="Query cannot be empty")
+
+        user_id = current_user.id
+        context = rag_system.get_context_for_query(query, user_id=user_id)
+
+        if not context:
+            answer = ("I couldn't find relevant information in your documents. "
+                      "Please try uploading medical documents first or rephrasing your query.")
+            sources = []
+        else:
+            enhanced_prompt = f"""
+You are a medical AI assistant with access to uploaded medical documents. 
+Use the following context from the medical documents to answer the user's question accurately.
+
+Context from uploaded documents:
+{context}
+
+User Question: {query}
+
+Instructions:
+1. Base your answer primarily on the provided context
+2. If the context doesn't contain sufficient information, say so clearly
+3. Always remind users to consult healthcare professionals for medical decisions
+4. Be precise and avoid speculation
+
+Answer:
+"""
+
+            model = genai.initialize(api_key=os.getenv("GOOGLE_API_KEY"))
+            response = model.generate_content(enhanced_prompt)
+            answer = response.text.strip()
+
+            source_docs = rag_system.search_knowledge_base(query, k=3, user_id=user_id)
+            sources = [
+                {
+                    "filename": doc.metadata.get("file_path", "Unknown").split('/')[-1],
+                    "chunk_index": doc.metadata.get("chunk_index", 0),
+                    "content_preview": doc.page_content[:200] + "..."
+                }
+                for doc in source_docs
+            ]
+
+    # Return combined response
+    return {
+        "upload_results": upload_results if upload_results else None,
+        "query": query,
+        "answer": answer,
+        "sources": sources
+    }
+
