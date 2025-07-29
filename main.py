@@ -129,34 +129,6 @@ async def get_chat_history(
     
     return {"chat_history": chat_history, "total_sessions": len(chat_history)}
 
-@app.post("/upload-documents")
-async def upload_documents(
-    files: List[UploadFile] = File(...),
-    current_user: DBUser = Depends(get_current_active_user),
-    db = Depends(get_db)
-):
-    results = []
-
-    uploads_folder = "uploads"
-    os.makedirs(uploads_folder, exist_ok=True)
-
-    for file in files:
-        ext = file.filename.split(".")[-1].lower()
-        if ext not in ('pdf', 'docx', 'doc', 'txt', 'xlsx', 'xls'):
-            results.append({"filename": file.filename, "status": "error", "message": "Unsupported"})
-            continue
-        
-        file_path = os.path.join("uploads", f"{current_user.id}_{file.filename}")
-        async with aiofiles.open(file_path, 'wb') as out_file:
-            content = await file.read()
-            await out_file.write(content)
-        
-        result = await rag_system.process_uploaded_file(file_path, ext, current_user.id, db)
-        result["filename"] = file.filename
-        results.append(result)
-    return {"results": results}
-
-
 @app.get("/my-documents")
 async def get_my_documents(
     current_user: DBUser = Depends(get_current_active_user),
@@ -180,73 +152,7 @@ async def get_my_documents(
         ]
     }
 
-@app.post("/query-documents")
-async def query_documents(
-    query: str = Form(...),
-    use_personal_docs: bool = Form(True),
-    current_user: DBUser = Depends(get_current_active_user)
-):
-    """Query the knowledge base with RAG."""
-    
-    if not query.strip():
-        raise HTTPException(status_code=400, detail="Query cannot be empty")
-    
-    try:
-        # Get relevant context
-        user_id = current_user.id if use_personal_docs else None
-        context = rag_system.get_context_for_query(query, user_id=user_id)
-        
-        if not context:
-            return {
-                "query": query,
-                "answer": "I couldn't find relevant information in your documents. Please try uploading medical documents first or rephrasing your query.",
-                "sources": []
-            }
-        
-        # Generate response using your existing Gemini model
-        enhanced_prompt = f"""
-        You are a medical AI assistant with access to uploaded medical documents. 
-        Use the following context from the medical documents to answer the user's question accurately.
-        
-        Context from uploaded documents:
-        {context}
-        
-        User Question: {query}
-        
-        Instructions:
-        1. Base your answer primarily on the provided context
-        2. If the context doesn't contain sufficient information, say so clearly
-        3. Always remind users to consult healthcare professionals for medical decisions
-        4. Be precise and avoid speculation
-        
-        Answer:
-        """
-        # Initialize the generative AI model
-        model = genai.initialize(api_key=os.getenv("GOOGLE_API_KEY"))
-        response = model.generate_content(enhanced_prompt)
-        answer = response.text.strip()
-        
-        # Get source documents for transparency
-        source_docs = rag_system.search_knowledge_base(query, k=3, user_id=user_id)
-        sources = [
-            {
-                "filename": doc.metadata.get("file_path", "Unknown").split('/')[-1],
-                "chunk_index": doc.metadata.get("chunk_index", 0),
-                "content_preview": doc.page_content[:200] + "..."
-            }
-            for doc in rag_system.search_knowledge_base(query, k=3, user_id=user_id)
-        ]
-        
-        return {
-            "query": query,
-            "answer": answer,
-            "sources": sources,
-            "context_used": len(context) > 0
-        }
-        
-    except Exception as e:
-        logger.error(f"Error in document query: {e}")
-        raise HTTPException(status_code=500, detail="Error processing your query")
+
 
 @app.delete("/documents/{document_id}")
 async def delete_document(

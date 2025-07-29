@@ -32,17 +32,20 @@ api_key = os.getenv("GOOGLE_API_KEY")
 if not api_key:
     raise ValueError("GOOGLE_API_KEY environment variable not set")
 
-genai.configure(api_key=api_key)
-model = genai.GenerativeModel("gemini-2.0-flash-exp")
+genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+model = genai.GenerativeModel("gemini-2.0-flash")
+
 
 # Global vector store
-vector_store = rag_system.vector_store
 VECTOR_STORE_PATH = "vector_store.pkl"
+
 if os.path.exists(VECTOR_STORE_PATH):
     with open(VECTOR_STORE_PATH, "rb") as f:
-        vector_store = pickle.load(f)
-else:
-    vector_store = None
+        loaded_store = pickle.load(f)
+    rag_system.vector_store = loaded_store
+
+vector_store = rag_system.vector_store
+
 
 
 # Medical triage stages
@@ -148,9 +151,6 @@ async def medical_triage(
         db.commit()
         db.refresh(db_session)
     
-    # Get in-memory session for processing logic
-    session = triage_sessions.get(sess_id, TriageSession())
-    triage_sessions[sess_id] = session
     
     message = req.message.strip()
     
@@ -622,35 +622,51 @@ async def upload_pdfs(
 
 
 @router.post("/ask", response_class=PlainTextResponse)
-async def ask_bot(
+async def ask(
     prompt: str = Form(...),
-    current_user: DBUser = Depends(get_current_active_user)
+    current_user: DBUser = Depends(get_current_active_user),
 ):
     if rag_system.vector_store is None:
-        raise HTTPException(400, "Knowledge base not ready; upload PDFs first.")
-    kb = MedicalKnowledgeBase(rag_system.vector_store, user_id=current_user.id)
-    context = kb.get_context(prompt, k=3)
-    custom_prompt = (
-        "You are the best doctor. Use the following documents to answer precisely.\n"
-        f"Context: {context}\n\nQuestion: {prompt}"
-    )
-    resp = model.generate_content(custom_prompt)
-    return resp.text or "No answer from model"
+        raise HTTPException(status_code=400, detail="Knowledge base is not ready. Upload documents first.")
+
+    user_id = current_user.id
+    kb = rag_system
+    context = kb.get_context_for_query(prompt, user_id=user_id)
+
+    if not context:
+        return "I couldn't find relevant information in your uploaded documents. Please upload documents first or rephrase your question."
+
+    prompt_template = f"""
+You are a medical AI assistant with access to the user's medical documents:
+
+Context:
+{context}
+
+User question:
+{prompt}
+
+Provide an accurate, concise answer based on the context above.
+"""
+
+    response = model.generate_content(prompt_template)
+
+    return response.text.strip() or "No answer generated."
+
 
 
 # Simple chat endpoint (existing functionality)
 @router.post("/chat")
-async def chat_and_upload(
+async def chat(
     files: Optional[List[UploadFile]] = File(None),
     query: Optional[str] = Form(None),
     current_user: DBUser = Depends(get_current_active_user),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db)
 ):
     upload_results = []
     answer = None
     sources = []
 
-    # Handle file uploads if present
+    # Handle file uploads
     if files:
         uploads_folder = "uploads"
         os.makedirs(uploads_folder, exist_ok=True)
@@ -670,60 +686,60 @@ async def chat_and_upload(
                 content = await file.read()
                 await out_file.write(content)
 
-            result = await rag_system.process_uploaded_file(file_path, ext, current_user.id, db)
-            result["filename"] = file.filename
-            upload_results.append(result)
+            try:
+                res = await rag_system.process_uploaded_file(file_path, ext, current_user.id, db)
+                res["filename"] = file.filename
+                upload_results.append(res)
+            except Exception as e:
+                logger.error(f"Error processing file {file.filename}: {e}")
+                upload_results.append({
+                    "filename": file.filename,
+                    "status": "error",
+                    "message": str(e)
+                })
 
-    # Handle chatbot query if present
+    # Handle query (if any)
     if query:
         if not query.strip():
             raise HTTPException(status_code=400, detail="Query cannot be empty")
 
         user_id = current_user.id
-        context = rag_system.get_context_for_query(query, user_id=user_id)
+        kb = rag_system
+        context = kb.get_context_for_query(query, user_id=user_id)
 
         if not context:
-            answer = ("I couldn't find relevant information in your documents. "
-                      "Please try uploading medical documents first or rephrasing your query.")
+            answer = "I couldn't find relevant information in your documents. Please upload documents or rephrase your question."
             sources = []
         else:
-            enhanced_prompt = f"""
-You are a medical AI assistant with access to uploaded medical documents. 
-Use the following context from the medical documents to answer the user's question accurately.
+            prompt_template = f"""
+You are a medical AI assistant with access to the user's uploaded medical documents below.
 
-Context from uploaded documents:
+Context:
 {context}
 
-User Question: {query}
+User question:
+{query}
 
-Instructions:
-1. Base your answer primarily on the provided context
-2. If the context doesn't contain sufficient information, say so clearly
-3. Always remind users to consult healthcare professionals for medical decisions
-4. Be precise and avoid speculation
-
-Answer:
+Please provide an accurate and concise answer based on the above context.
 """
-
-            model = genai.initialize(api_key=os.getenv("GOOGLE_API_KEY"))
-            response = model.generate_content(enhanced_prompt)
+            
+            response = model.generate_content(prompt_template)
             answer = response.text.strip()
 
-            source_docs = rag_system.search_knowledge_base(query, k=3, user_id=user_id)
+            # Provide source document snippets for transparency
+            source_docs = kb.search_knowledge_base(query, k=3, user_id=user_id)
             sources = [
                 {
-                    "filename": doc.metadata.get("file_path", "Unknown").split('/')[-1],
-                    "chunk_index": doc.metadata.get("chunk_index", 0),
-                    "content_preview": doc.page_content[:200] + "..."
+                    "filename": d.metadata.get("file_path", "Unknown").split('/')[-1],
+                    "chunk_index": d.metadata.get("chunk_index", 0),
+                    "content_preview": d.page_content[:200] + "..."
                 }
-                for doc in source_docs
+                for d in source_docs
             ]
 
-    # Return combined response
     return {
         "upload_results": upload_results if upload_results else None,
         "query": query,
         "answer": answer,
         "sources": sources
     }
-
