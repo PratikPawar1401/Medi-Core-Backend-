@@ -8,9 +8,10 @@ from typing import List
 import os
 import aiofiles
 from rag_system import rag_system
+import google.generativeai as genai
 from database import DocumentStore, get_db
 import google.generativeai as genai
-
+from fastapi import Depends, HTTPException, UploadFile, File, Form
 from database import create_tables, get_db, User as DBUser, ChatSession, ChatMessage
 from chatbot import router as chatbot_router
 from auth.auth_handler import (
@@ -20,14 +21,16 @@ from auth.auth_handler import (
 )
 from auth.models import UserCreate, UserUpdate, UserProfile, Token
 import logging
-
-logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+from chatbot import router as chatbot_router
 
 
 load_dotenv()
 
 app = FastAPI(title="FastAPI Medical Triage Backend with Database", version="1.0.0")
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+app.include_router(chatbot_router, prefix="", tags=["medical-chatbot"])
 
 # Create database tables on startup
 @app.on_event("startup")
@@ -121,59 +124,29 @@ async def get_chat_history(
 async def upload_documents(
     files: List[UploadFile] = File(...),
     current_user: DBUser = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
+    db = Depends(get_db)
 ):
-    """Upload and process medical documents for knowledge base."""
-    
-    if not files:
-        raise HTTPException(status_code=400, detail="No files provided")
-    
-    # Create upload directory if it doesn't exist
-    upload_dir = "uploads"
-    os.makedirs(upload_dir, exist_ok=True)
-    
     results = []
-    
+
+    uploads_folder = "uploads"
+    os.makedirs(uploads_folder, exist_ok=True)
+
     for file in files:
-        # Validate file type
-        allowed_types = ['pdf', 'docx', 'doc', 'txt', 'xlsx', 'xls']
-        file_extension = file.filename.split('.')[-1].lower()
-        
-        if file_extension not in allowed_types:
-            results.append({
-                "filename": file.filename,
-                "status": "error",
-                "message": f"Unsupported file type: {file_extension}"
-            })
+        ext = file.filename.split(".")[-1].lower()
+        if ext not in ('pdf', 'docx', 'doc', 'txt', 'xlsx', 'xls'):
+            results.append({"filename": file.filename, "status": "error", "message": "Unsupported"})
             continue
         
-        # Save file
-        file_path = os.path.join(upload_dir, f"{current_user.id}_{file.filename}")
+        file_path = os.path.join("uploads", f"{current_user.id}_{file.filename}")
+        async with aiofiles.open(file_path, 'wb') as out_file:
+            content = await file.read()
+            await out_file.write(content)
         
-        try:
-            async with aiofiles.open(file_path, 'wb') as f:
-                content = await file.read()
-                await f.write(content)
-            
-            # Process file
-            result = await rag_system.process_uploaded_file(
-                file_path=file_path,
-                file_type=file_extension,
-                user_id=current_user.id,
-                db=db
-            )
-            
-            result["filename"] = file.filename
-            results.append(result)
-            
-        except Exception as e:
-            results.append({
-                "filename": file.filename,
-                "status": "error",
-                "message": str(e)
-            })
-    
+        result = await rag_system.process_uploaded_file(file_path, ext, current_user.id, db)
+        result["filename"] = file.filename
+        results.append(result)
     return {"results": results}
+
 
 @app.get("/my-documents")
 async def get_my_documents(
@@ -239,7 +212,8 @@ async def query_documents(
         
         Answer:
         """
-        
+        # Initialize the generative AI model
+        model = genai.initialize(api_key=os.getenv("GOOGLE_API_KEY"))
         response = model.generate_content(enhanced_prompt)
         answer = response.text.strip()
         
@@ -251,7 +225,7 @@ async def query_documents(
                 "chunk_index": doc.metadata.get("chunk_index", 0),
                 "content_preview": doc.page_content[:200] + "..."
             }
-            for doc in source_docs
+            for doc in rag_system.search_knowledge_base(query, k=3, user_id=user_id)
         ]
         
         return {

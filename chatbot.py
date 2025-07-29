@@ -89,7 +89,7 @@ class MedicalKnowledgeBase:
 
 
 
-kb = MedicalKnowledgeBase()
+kb = MedicalKnowledgeBase(rag_system.vector_store, user_id=None)  
 
 # Request/Response models
 class ChatRequest(BaseModel):
