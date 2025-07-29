@@ -593,8 +593,11 @@ Assessment completed using clinical decision support tools and medical knowledge
         assessment = response.text.strip()
         
         # Mark session as completed
-        session.completed = True
-        session.stage = TriageStage.COMPLETED
+        # session.completed = True
+        # session.stage = TriageStage.COMPLETED
+
+        # clean and format the assessment
+        # assessment = clean_medical_assessment(assessment)
         
         return assessment
         
