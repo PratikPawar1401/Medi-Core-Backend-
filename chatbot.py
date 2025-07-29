@@ -18,6 +18,8 @@ from sqlalchemy.orm import Session
 from database import get_db, ChatSession as DBChatSession, ChatMessage as DBChatMessage, User as DBUser
 from auth.auth_handler import get_current_active_user
 from fastapi import Depends
+from rag_system import rag_system
+from langchain_core.documents import Document
 
 
 load_dotenv()
@@ -67,16 +69,25 @@ triage_sessions: Dict[str, TriageSession] = {}
 
 # Knowledge base integration
 class MedicalKnowledgeBase:
-    def __init__(self):
+    def __init__(self, vector_store, user_id: Optional[int] = None):
         self.vector_store = vector_store
-    
-    def query_symptoms(self, symptoms: List[str], context: str = "") -> str:
+        self.user_id = user_id
+
+    def query(self, text: str, k: int = 3) -> List[Document]:
         if not self.vector_store:
-            return "Knowledge base not available."
-        
-        symptom_query = f"symptoms: {', '.join(symptoms)} {context}"
-        docs = self.vector_store.similarity_search(symptom_query, k=3)
-        return " ".join([doc.page_content for doc in docs])
+            return []
+        # similarity_search returns Documents
+        docs = self.vector_store.similarity_search(text, k=k)
+        # Optionally filter by metadata["user_id"]
+        if self.user_id:
+            docs = [d for d in docs if d.metadata.get("user_id")==self.user_id]
+        return docs
+
+    def get_context(self, text: str, k: int = 3) -> str:
+        docs = self.query(text, k)
+        return " ".join(d.page_content for d in docs)
+
+
 
 kb = MedicalKnowledgeBase()
 
@@ -120,6 +131,7 @@ async def medical_triage(
     
     sess_id = req.session_id or str(uuid4())
     
+    session.data["user_id"] = current_user.id
     # Get or create database session
     db_session = db.query(DBChatSession).filter(DBChatSession.session_id == sess_id).first()
     if not db_session:
@@ -465,18 +477,15 @@ async def handle_summary_confirmation(session: TriageSession, message: str) -> s
         )
 
 async def generate_final_assessment(session: TriageSession) -> str:
-    """Generate comprehensive medical assessment using AI and knowledge base."""
-    
-    # Prepare context from knowledge base
-    symptoms_list = extract_symptoms_from_text(
-        f"{session.data.get('main_symptoms', '')} {session.data.get('associated_symptoms', '')}"
+    symptoms_text = (
+        f"{session.data.get('main_symptoms','')} "
+        f"{session.data.get('associated_symptoms','')}"
     )
+    kb = MedicalKnowledgeBase(vector_store, user_id=session.data.get("user_id"))
+    kb_context = kb.get_context(symptoms_text, k=3)
     
-    kb_context = ""
-    if symptoms_list and vector_store:
-        kb_context = kb.query_symptoms(symptoms_list)
-    
-    # Create comprehensive assessment prompt
+
+    # comprehensive assessment prompt
     prompt = f"""
 You are Dr. AI, an experienced emergency medicine physician conducting a comprehensive medical triage assessment. 
 
@@ -578,8 +587,10 @@ def extract_symptoms_from_text(text: str) -> List[str]:
 
 # Keep your existing endpoints
 @router.post("/upload")
-async def upload_pdfs(files: List[UploadFile] = File(...)):
-    """Ingest PDFs and build/update vector store."""
+async def upload_pdfs(
+    files: List[UploadFile] = File(...),
+    current_user: DBUser = Depends(get_current_active_user)
+):
     global vector_store
     docs = []
     for file in files:
@@ -589,73 +600,59 @@ async def upload_pdfs(files: List[UploadFile] = File(...)):
         with open(path, "wb") as f:
             f.write(content)
         loader = PyPDFLoader(path)
-        docs.extend(loader.load())
-    
+        for doc in loader.load():
+            # attach user metadata
+            doc.metadata["user_id"] = current_user.id
+            docs.append(doc)
+
     embeddings = HuggingFaceEmbeddings()
     if vector_store is None:
         vector_store = FAISS.from_documents(docs, embeddings)
-        kb.vector_store = vector_store
     else:
         vector_store.add_documents(docs)
-    
+
     with open(VECTOR_STORE_PATH, "wb") as f:
         pickle.dump(vector_store, f)
+
     return {"message": "PDFs processed and knowledge base updated."}
 
+
 @router.post("/ask", response_class=PlainTextResponse)
-async def ask_bot(prompt: str = Form(...)):
-    """Query the knowledge base via Gemini model."""
+async def ask_bot(
+    prompt: str = Form(...),
+    current_user: DBUser = Depends(get_current_active_user)
+):
     if vector_store is None:
-        raise HTTPException(status_code=400, detail="Knowledge base not ready; upload PDFs first.")
-    docs = vector_store.similarity_search(prompt)
-    context = " ".join([d.page_content for d in docs])
+        raise HTTPException(400, "Knowledge base not ready; upload PDFs first.")
+    kb = MedicalKnowledgeBase(vector_store, user_id=current_user.id)
+    context = kb.get_context(prompt, k=3)
     custom_prompt = (
-        f"You are the best doctor. Only provide medical-related answers. "
-        f"Context: {context} Question: {prompt}"
+        "You are the best doctor. Use the following documents to answer precisely.\n"
+        f"Context: {context}\n\nQuestion: {prompt}"
     )
     resp = model.generate_content(custom_prompt)
     return resp.text or "No answer from model"
 
 # Simple chat endpoint (existing functionality)
 @router.post("/chat", response_model=ChatResponse)
-async def simple_chat(req: ChatRequest):
-    """Simple chat endpoint for basic medical questions."""
+async def simple_chat(
+    req: ChatRequest,
+    current_user: DBUser = Depends(get_current_active_user)
+):
     sess_id = req.session_id or str(uuid4())
-    
-    try:
-        if vector_store:
-            docs = vector_store.similarity_search(req.message, k=2)
-            context = " ".join([doc.page_content for doc in docs])
-        else:
-            context = ""
-        
-        prompt = f"""
-        You are a helpful medical assistant. Provide informative responses based on the context.
-        
-        Context: {context}
-        Question: {req.message}
-        
-        Provide a helpful response, but always remind users to consult healthcare professionals for serious concerns.
-        """
-        
-        response = model.generate_content(prompt)
-        reply = response.text.strip()
-        
-        return ChatResponse(
-            session_id=sess_id,
-            reply=reply,
-            finished=True,
-            stage="simple_chat",
-            progress="Complete",
-            extracted_info={"type": "simple_query"}
-        )
-    except Exception as e:
-        logger.error(f"Error in simple chat: {e}")
-        return ChatResponse(
-            session_id=sess_id,
-            reply="I'm having trouble responding right now. Please try again or consult a healthcare professional.",
-            finished=True,
-            stage="error",
-            progress="Error",
-            extracted_info={"error": str(e)}
-        )
+    kb = MedicalKnowledgeBase(vector_store, user_id=current_user.id)
+    context = kb.get_context(req.message, k=2)
+    prompt = (
+        "You are a helpful medical assistant. Base your answer on the context below.\n\n"
+        f"Context: {context}\n\nQuestion: {req.message}\n\n"
+        "Always remind users to consult healthcare professionals for serious concerns."
+    )
+    response = model.generate_content(prompt)
+    return ChatResponse(
+        session_id=sess_id,
+        reply=response.text.strip(),
+        finished=True,
+        stage="simple_chat",
+        progress="Complete",
+        extracted_info={"context_provided": bool(context)}
+    )

@@ -31,6 +31,23 @@ class User(Base):
     # Relationships
     chat_sessions = relationship("ChatSession", back_populates="user")
     chat_messages = relationship("ChatMessage", back_populates="user")
+    documents = relationship("DocumentStore", back_populates="user")
+
+class DocumentStore(Base):
+    __tablename__ = "document_store"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    filename = Column(String, nullable=False)
+    file_type = Column(String, nullable=False)
+    file_path = Column(String, nullable=False)
+    chunk_count = Column(Integer, nullable=False)
+    processed_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Relationships
+    user = relationship("User", back_populates="documents")
+
+
 
 class ChatSession(Base):
     __tablename__ = "chat_sessions"
