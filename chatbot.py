@@ -32,20 +32,18 @@ api_key = os.getenv("GOOGLE_API_KEY")
 if not api_key:
     raise ValueError("GOOGLE_API_KEY environment variable not set")
 
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-model = genai.GenerativeModel("gemini-2.0-flash")
-
+genai.configure(api_key=api_key)
+model = genai.GenerativeModel("gemini-2.0-flash-exp")
 
 # Global vector store
-VECTOR_STORE_PATH = "vector_store.pkl"
 
+VECTOR_STORE_PATH = "vector_store.pkl"
 if os.path.exists(VECTOR_STORE_PATH):
     with open(VECTOR_STORE_PATH, "rb") as f:
         loaded_store = pickle.load(f)
     rag_system.vector_store = loaded_store
 
 vector_store = rag_system.vector_store
-
 
 
 # Medical triage stages
@@ -93,6 +91,47 @@ class MedicalKnowledgeBase:
         return " ".join(d.page_content for d in docs)
 
 
+#helper functions for formatting
+def format_confirmation(item: str) -> str:
+    """Standard confirmation format"""
+    return f"✓ {item}"
+
+def format_section_header(title: str) -> str:
+    """Standard section header format"""
+    return f"{title.upper()}:"
+
+def get_concise_progress(stage_num: int, total: int) -> str:
+    """Concise progress indicator"""
+    return f"{stage_num}/{total}"
+
+def clean_medical_assessment(text: str) -> str:
+    """Clean and format medical assessment text."""
+    import re
+    
+    # Remove standalone asterisks
+    text = re.sub(r'(?<!\)\(?!\*)', '', text)
+    
+    # Clean up markdown bold formatting
+    text = re.sub(r'\\(.?)\\*', r'\1', text)
+    
+    # Ensure proper spacing around headers
+    text = re.sub(r'^([A-Z][A-Z\s]+:)', r'\n\1', text, flags=re.MULTILINE)
+    
+    # Clean up bullet points
+    text = re.sub(r'•\s*', '• ', text)
+    
+    # Remove extra whitespace
+    text = re.sub(r'\n\s*\n\s*\n', '\n\n', text)
+    text = re.sub(r'[ \t]+', ' ', text)
+    
+    # Ensure proper line breaks before major sections
+    sections = ['CLINICAL SUMMARY:', 'DIFFERENTIAL DIAGNOSIS:', 'URGENCY ASSESSMENT:', 
+                'CLINICAL RECOMMENDATIONS:', 'FOLLOW-UP RECOMMENDATIONS:', 'MEDICAL DISCLAIMER:']
+    
+    for section in sections:
+        text = text.replace(section, f'\n{section}')
+    
+    return text.strip()
 
 
 
@@ -108,6 +147,7 @@ class ChatResponse(BaseModel):
     stage: str
     progress: str
     extracted_info: Dict[str, Any] = {}
+    
 
 # Red flag symptoms for emergency detection
 RED_FLAG_SYMPTOMS = [
@@ -181,6 +221,10 @@ async def medical_triage(
         # Process based on current stage
         reply = await process_triage_stage(session, message)
         
+        # Clean up the reply if it's a final assessment
+        if session.stage == TriageStage.COMPLETED and "CLINICAL SUMMARY" in reply:
+            reply = clean_medical_assessment(reply)
+
         # Update database session with collected data
         if session.data.get('age'):
             db_session.age = session.data['age']
@@ -253,14 +297,13 @@ def check_emergency_keywords(message: str) -> bool:
 def generate_emergency_response() -> str:
     """Generate emergency response for red flag symptoms."""
     return (
-        "🚨 **EMERGENCY ALERT** 🚨\n\n"
-        "Based on your symptoms, this requires IMMEDIATE medical attention.\n\n"
-        "**Please do one of the following RIGHT NOW:**\n"
-        "• Call 911 (US) or your local emergency number\n"
-        "• Go to the nearest Emergency Room\n"
-        "• Call emergency services immediately\n\n"
-        "Do not drive yourself. Have someone drive you or call an ambulance.\n\n"
-        "⚠️ This is a medical emergency that cannot wait."
+        "EMERGENCY ALERT\n\n"
+        "Your symptoms require immediate medical attention.\n\n"
+        "DO NOT DELAY:\n"
+        "• Call 112 immediately\n"
+        "• Go to nearest Emergency Room\n"
+        "• Do not drive yourself\n\n"
+        "This cannot wait."
     )
 
 async def process_triage_stage(session: TriageSession, message: str) -> str:
@@ -291,15 +334,15 @@ def handle_greeting(session: TriageSession, message: str) -> str:
     """Handle initial greeting and introduction."""
     session.stage = TriageStage.CONSENT
     return (
-        "👋 Hello! I'm Dr. AI, your digital medical triage assistant.\n\n"
-        "I'll guide you through a structured assessment of your symptoms following "
-        "clinical protocols. This process typically takes 5-10 minutes.\n\n"
-        "**Important Disclaimers:**\n"
-        "• This is NOT a substitute for professional medical advice\n"
-        "• For emergencies, call 911 immediately\n"
-        "• This assessment is for informational purposes only\n\n"
-        "Do you consent to proceed with this medical assessment?"
-    )
+    "I will guide you through a structured assessment of your symptoms based on clinical protocols. This process typically takes 5-10 minutes.\n\n"
+    "Important Disclaimers:\n"
+    "• This is not a substitute for professional medical advice.\n"
+    "• For emergencies, call 911 immediately.\n"
+    "• This assessment is for informational purposes only.\n\n"
+    "Do you consent to proceed with this medical assessment?"
+)
+
+
 
 def handle_consent(session: TriageSession, message: str) -> str:
     """Handle consent confirmation."""
@@ -308,18 +351,12 @@ def handle_consent(session: TriageSession, message: str) -> str:
     if any(word in message_lower for word in ["yes", "ok", "sure", "agree", "consent", "proceed"]):
         session.data["consent"] = True
         session.stage = TriageStage.DEMOGRAPHICS
-        return (
-            "✅ Thank you for your consent.\n\n"
-            "Let's begin with some basic information:\n\n"
-            "**Please provide your age and biological sex.**\n"
-            "Example: 'I am 32 years old and female' or '45, male'"
-        )
+        return "Please provide your age and biological sex (e.g., '32, female' or '45, male'):"
     elif any(word in message_lower for word in ["no", "don't", "refuse", "decline"]):
         session.completed = True
         return (
             "I understand. If you change your mind, feel free to start a new conversation.\n\n"
-            "For immediate medical concerns, please contact your healthcare provider "
-            "or call emergency services."
+            "For immediate medical concerns, please contact your healthcare provider or call emergency services."
         )
     else:
         return (
@@ -327,24 +364,38 @@ def handle_consent(session: TriageSession, message: str) -> str:
             "or 'no' if you prefer not to continue."
         )
 
+
 def handle_demographics(session: TriageSession, message: str) -> str:
     """Extract and validate demographic information."""
     
     # Extract age
     age_match = re.search(r'\b(\d{1,3})\b', message)
     
-    # Extract sex
+    # Extract sex with whole-word matching to avoid substring issues
     sex_patterns = {
-        'male': ['male', 'man', 'm', 'boy'],
-        'female': ['female', 'woman', 'f', 'girl'],
-        'other': ['other', 'non-binary', 'nonbinary', 'transgender']
+        'male': [r'\bmale\b', r'\bman\b', r'\bm\b', r'\bboy\b'],  # \b ensures whole-word match
+        'female': [r'\bfemale\b', r'\bwoman\b', r'\bf\b', r'\bgirl\b'],
+        'other': [r'\bother\b', r'\bnon-binary\b', r'\bnonbinary\b', r'\btransgender\b']
     }
     
     detected_sex = None
+    message_lower = message.lower()
+    
+    # Check patterns in a way that prefers exact matches (loop through all, but collect possibles and pick the best)
+    possibles = []
     for sex, patterns in sex_patterns.items():
-        if any(pattern in message.lower() for pattern in patterns):
-            detected_sex = sex
-            break
+        for pattern in patterns:
+            if re.search(pattern, message_lower):  # Use regex search for precision
+                possibles.append(sex)
+                break  # One match per category
+    
+    if possibles:
+        # If multiple matches, prefer 'female' or 'other' over 'male' if explicit (or use first for simplicity)
+        # For now, take the first, but you can add logic like prioritizing based on count
+        detected_sex = possibles[0]
+        # Optional: Count occurrences and pick the one with most mentions
+        # counts = {s: sum(1 for p in sex_patterns[s] if re.search(p, message_lower)) for s in possibles}
+        # detected_sex = max(counts, key=counts.get)
     
     if age_match and detected_sex:
         age = int(age_match.group(1))
@@ -353,8 +404,8 @@ def handle_demographics(session: TriageSession, message: str) -> str:
             session.data["sex"] = detected_sex
             session.stage = TriageStage.MEDICAL_HISTORY
             return (
-                f"✅ Recorded: {age} years old, {detected_sex}\n\n"
-                "**Medical History:**\n"
+                f"Recorded: {age} years old, {detected_sex}\n\n"
+                "Medical History:\n"
                 "Do you have any significant medical conditions, ongoing health issues, "
                 "or take any medications regularly?\n\n"
                 "Please include:\n"
@@ -375,21 +426,16 @@ def handle_demographics(session: TriageSession, message: str) -> str:
             "• '42 year old woman'"
         )
 
+
 def handle_medical_history(session: TriageSession, message: str) -> str:
     """Record medical history."""
     session.data["medical_history"] = message
     session.stage = TriageStage.MAIN_SYMPTOMS
     return (
-        "✅ Medical history recorded.\n\n"
-        "**Main Symptoms:**\n"
-        "Now, please describe your main symptoms or chief complaint. "
-        "What brought you here today?\n\n"
-        "Please be specific about:\n"
-        "• What you're experiencing\n"
-        "• Where in your body\n"
-        "• When it started\n"
-        "• How severe it is (1-10 scale if applicable)"
-    )
+    "✓ Medical history noted.\n\n"
+    "Main Symptoms: Describe what you're experiencing, where, when it started, and severity (1-10):"
+)
+
 
 def handle_main_symptoms(session: TriageSession, message: str) -> str:
     """Record main symptoms and check for red flags."""
@@ -403,33 +449,20 @@ def handle_main_symptoms(session: TriageSession, message: str) -> str:
     
     session.stage = TriageStage.SYMPTOM_DETAILS
     return (
-        "✅ Main symptoms recorded.\n\n"
-        "**Symptom Details:**\n"
-        "Can you provide more details about your symptoms?\n\n"
-        "Please tell me about:\n"
-        "• **Timing:** When exactly did this start? (hours, days, weeks ago)\n"
-        "• **Pattern:** Is it constant or does it come and go?\n"
-        "• **Severity:** On a scale of 1-10, how bad is it?\n"
-        "• **What makes it better or worse?**"
-    )
+    "✓ Symptoms noted.\n\n"
+    "Details: How long have you had this? Is it constant or intermittent? What makes it better/worse?"
+)
+
 
 def handle_symptom_details(session: TriageSession, message: str) -> str:
     """Record detailed symptom information."""
     session.data["symptom_details"] = message
     session.stage = TriageStage.ASSOCIATED_SYMPTOMS
     return (
-        "✅ Symptom details recorded.\n\n"
-        "**Associated Symptoms:**\n"
-        "Are you experiencing any other symptoms along with your main complaint?\n\n"
-        "Common associated symptoms to consider:\n"
-        "• Fever or chills\n"
-        "• Nausea or vomiting\n"
-        "• Dizziness or lightheadedness\n"
-        "• Changes in vision or hearing\n"
-        "• Difficulty breathing\n"
-        "• Changes in appetite or sleep\n\n"
-        "Please list any additional symptoms, or say 'none' if no others."
-    )
+    "✓ Details recorded.\n\n"
+    "Other Symptoms: Any fever, nausea, dizziness, breathing issues, or other symptoms? (Say 'none' if not applicable)"
+)
+
 
 def handle_associated_symptoms(session: TriageSession, message: str) -> str:
     """Record associated symptoms and prepare summary."""
@@ -440,11 +473,11 @@ def handle_associated_symptoms(session: TriageSession, message: str) -> str:
     summary = create_patient_summary(session.data)
     
     return (
-        "✅ Associated symptoms recorded.\n\n"
-        "**Summary Confirmation:**\n"
+        "Associated symptoms recorded.\n\n"
+        "Summary Confirmation:\n"
         "Let me confirm the information you've provided:\n\n"
         f"{summary}\n\n"
-        "**Is this information correct?** Please respond with:\n"
+        "Is this information correct? Please respond with:\n"
         "• 'Yes' or 'Correct' if everything is accurate\n"
         "• 'No' or tell me what needs to be corrected"
     )
@@ -452,13 +485,13 @@ def handle_associated_symptoms(session: TriageSession, message: str) -> str:
 def create_patient_summary(data: Dict[str, Any]) -> str:
     """Create a formatted summary of patient information."""
     return f"""
-📋 **Patient Summary:**
-• **Age:** {data.get('age', 'Not provided')} years
-• **Sex:** {data.get('sex', 'Not provided')}
-• **Medical History:** {data.get('medical_history', 'Not provided')}
-• **Main Symptoms:** {data.get('main_symptoms', 'Not provided')}
-• **Symptom Details:** {data.get('symptom_details', 'Not provided')}
-• **Associated Symptoms:** {data.get('associated_symptoms', 'Not provided')}
+Patient Summary:
+• Age: {data.get('age', 'Not provided')} years
+• Sex: {data.get('sex', 'Not provided')}
+• Medical History: {data.get('medical_history', 'Not provided')}
+• Main Symptoms: {data.get('main_symptoms', 'Not provided')}
+• Symptom Details: {data.get('symptom_details', 'Not provided')}
+• Associated Symptoms: {data.get('associated_symptoms', 'Not provided')}
 """
 
 async def handle_summary_confirmation(session: TriageSession, message: str) -> str:
@@ -468,11 +501,12 @@ async def handle_summary_confirmation(session: TriageSession, message: str) -> s
     if any(word in message_lower for word in ["yes", "correct", "accurate", "right", "confirm"]):
         session.stage = TriageStage.FINAL_ASSESSMENT
         return (
-            "✅ Information confirmed.\n\n"
-            "🔍 **Analyzing your symptoms...**\n\n"
+            "Information confirmed.\n\n"
+            "Analyzing your symptoms...\n\n"
             "I'm now processing your information using clinical protocols and "
             "medical knowledge base to provide you with a comprehensive assessment.\n\n"
             "This may take a moment..."
+            "Press any key to continue"
         )
     else:
         return (
@@ -491,7 +525,7 @@ async def generate_final_assessment(session: TriageSession) -> str:
 
     # comprehensive assessment prompt
     prompt = f"""
-You are Dr. AI, an experienced emergency medicine physician conducting a comprehensive medical triage assessment. 
+You are an AI medical assistant. Provide a concise clinical assessment.
 
 PATIENT INFORMATION:
 {create_patient_summary(session.data)}
@@ -501,57 +535,57 @@ RELEVANT MEDICAL KNOWLEDGE FROM DATABASE:
 
 Provide a structured clinical assessment following this exact format:
 
-🏥 **CLINICAL SUMMARY:**
+CLINICAL SUMMARY:
 [Brief 2-3 sentence overview of the patient's presentation]
 
-🔍 **DIFFERENTIAL DIAGNOSIS:**
-1. **Primary Consideration:** [Most likely diagnosis] 
+DIFFERENTIAL DIAGNOSIS:
+1. Primary Consideration: [Most likely diagnosis] 
    - Clinical reasoning: [Why this is most likely]
    - Typical presentation: [How this condition usually presents]
 
-2. **Alternative Diagnosis:** [Second possibility]
+2. Alternative Diagnosis: [Second possibility]
    - Clinical reasoning: [Why to consider this]
    - Key differentiating features: [What might distinguish this]
 
-3. **Less Likely Consideration:** [Third possibility]
+3. Less Likely Consideration: [Third possibility]
    - Brief rationale: [Why included in differential]
 
-⚡ **URGENCY ASSESSMENT:**
+URGENCY ASSESSMENT:
 Choose ONE and explain why:
-- 🚨 **EMERGENT** (Immediate care required - within minutes)
-- 🟡 **URGENT** (Same-day medical evaluation needed)
-- 🟠 **SEMI-URGENT** (Medical evaluation within 24-48 hours)
-- 🟢 **NON-URGENT** (Routine care appropriate)
+- EMERGENT (Immediate care required - within minutes)
+- URGENT (Same-day medical evaluation needed)
+- SEMI-URGENT (Medical evaluation within 24-48 hours)
+- NON-URGENT (Routine care appropriate)
 
-💊 **CLINICAL RECOMMENDATIONS:**
+CLINICAL RECOMMENDATIONS:
 
-**Immediate Actions:**
+Immediate Actions:
 • [Specific steps to take right now]
 • [Any immediate symptom management]
 
-**Medical Care:**
+Medical Care:
 • [When to seek care and where]
 • [What type of healthcare provider]
 • [What to expect during the visit]
 
-**Self-Care Management:**
+Self-Care Management:
 • [Home care measures if appropriate]
 • [Activity restrictions if any]
 • [Symptom monitoring guidelines]
 
-**Red Flag Warning Signs:**
+Red Flag Warning Signs:
 • [Specific symptoms requiring immediate medical attention]
 • [When to call 911 or go to ER]
 
-🏥 **FOLLOW-UP RECOMMENDATIONS:**
+FOLLOW-UP RECOMMENDATIONS:
 • [When to return if symptoms persist]
 • [Any specific tests or evaluations needed]
 
-⚠️ **MEDICAL DISCLAIMER:**
+MEDICAL DISCLAIMER:
 This assessment is for educational and informational purposes only. It does not constitute professional medical advice, diagnosis, or treatment. Always consult qualified healthcare professionals for definitive medical care. In case of emergency, call 911 immediately.
 
 ---
-*Assessment completed using clinical decision support tools and medical knowledge database.*
+Assessment completed using clinical decision support tools and medical knowledge database.
 """
     
     try:
@@ -569,12 +603,12 @@ This assessment is for educational and informational purposes only. It does not 
         session.completed = True
         return (
             "I apologize, but I'm experiencing technical difficulties generating your assessment.\n\n"
-            "**Please consult with a healthcare professional immediately for proper evaluation.**\n\n"
+            "Please consult with a healthcare professional immediately for proper evaluation.\n\n"
             "If you're experiencing concerning symptoms, contact:\n"
             "• Your primary care physician\n"
             "• Urgent care center\n"
             "• Emergency room (for severe symptoms)\n"
-            "• Call 911 for emergencies"
+            "• Call 112 for emergencies"
         )
 
 def extract_symptoms_from_text(text: str) -> List[str]:
