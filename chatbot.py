@@ -194,6 +194,49 @@ async def medical_triage(
     
     message = req.message.strip()
     
+    # ==== BEGIN RESTART PATCH ====
+    # Enable restart if user types anything like "restart", "restart assessment", "start again", etc.
+
+    RESTART_KEYWORDS = [
+        "restart", "start again", "restart the assessment", "restart assessment",
+        "begin again", "new assessment", "new triage", "reset", "repeat"
+    ]
+
+    message_lower = message.lower()
+    if session.completed or any(kw in message_lower for kw in RESTART_KEYWORDS):
+        # If user types any restart-variant, reset session
+        if any(kw in message_lower for kw in RESTART_KEYWORDS):
+            session = TriageSession()
+            session.data["user_id"] = current_user.id
+            triage_sessions[sess_id] = session
+            reply = handle_greeting(session, message)
+            return ChatResponse(
+                session_id=sess_id,
+                reply=reply,
+                finished=False,
+                stage=session.stage.value,
+                progress="1/9",
+                extracted_info={
+                    "info": "New triage assessment started.",
+                    "timestamp": datetime.now().isoformat()
+                }
+            )
+        elif session.completed:
+            return ChatResponse(
+                session_id=sess_id,
+                reply=(
+                    "✅ Your assessment is complete!\n"
+                    "If you'd like to start a new triage assessment, type 'restart', 'restart assessment', or 'start again'."
+                ),
+                finished=True,
+                stage="completed",
+                progress="9/9",
+                extracted_info={
+                    "timestamp": datetime.now().isoformat()
+                }
+            )
+    # ==== END RESTART PATCH ====
+    
     # Save user message to database
     user_message = DBChatMessage(
         session_id=sess_id,
@@ -337,7 +380,7 @@ def handle_greeting(session: TriageSession, message: str) -> str:
     "I will guide you through a structured assessment of your symptoms based on clinical protocols. This process typically takes 5-10 minutes.\n\n"
     "Important Disclaimers:\n"
     "• This is not a substitute for professional medical advice.\n"
-    "• For emergencies, call 911 immediately.\n"
+    "• For emergencies, call 112 immediately.\n"
     "• This assessment is for informational purposes only.\n\n"
     "Do you consent to proceed with this medical assessment?"
 )
@@ -575,14 +618,14 @@ Self-Care Management:
 
 Red Flag Warning Signs:
 • [Specific symptoms requiring immediate medical attention]
-• [When to call 911 or go to ER]
+• [When to call 112 or go to ER]
 
 FOLLOW-UP RECOMMENDATIONS:
 • [When to return if symptoms persist]
 • [Any specific tests or evaluations needed]
 
 MEDICAL DISCLAIMER:
-This assessment is for educational and informational purposes only. It does not constitute professional medical advice, diagnosis, or treatment. Always consult qualified healthcare professionals for definitive medical care. In case of emergency, call 911 immediately.
+This assessment is for educational and informational purposes only. It does not constitute professional medical advice, diagnosis, or treatment. Always consult qualified healthcare professionals for definitive medical care. In case of emergency, call 112 immediately.
 
 ---
 Assessment completed using clinical decision support tools and medical knowledge database.
