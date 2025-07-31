@@ -732,6 +732,14 @@ Provide an accurate, concise answer based on the context above.
 
     return response.text.strip() or "No answer generated."
 
+import re
+
+def clean_markdown(text: str) -> str:
+    # Remove bold (**text** or __text__) and italics (*text* or _text_)
+    # Handles multiline bold/italics as well
+    text = re.sub(r"(\*\*|__)(.*?)\1", r"\2", text, flags=re.DOTALL)
+    text = re.sub(r"(\*|_)(.*?)\1", r"\2", text, flags=re.DOTALL)
+    return text
 
 
 # Simple chat endpoint (existing functionality)
@@ -804,7 +812,8 @@ Please provide an accurate and concise answer based on the above context.
 """
             
             response = model.generate_content(prompt_template)
-            answer = response.text.strip()
+            answer = clean_markdown(response.text.strip())
+
 
             # Provide source document snippets for transparency
             source_docs = kb.search_knowledge_base(query, k=3, user_id=user_id)
