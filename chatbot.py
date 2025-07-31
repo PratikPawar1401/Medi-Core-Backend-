@@ -133,6 +133,13 @@ def clean_medical_assessment(text: str) -> str:
     
     return text.strip()
 
+def clean_markdown(text: str) -> str:
+    # Remove bold (**text** or __text__) and italics (*text* or _text_)
+    # Handles multiline bold/italics as well
+    text = re.sub(r"(\*\*|__)(.*?)\1", r"\2", text, flags=re.DOTALL)
+    text = re.sub(r"(\*|_)(.*?)\1", r"\2", text, flags=re.DOTALL)
+    return text
+
 
 
 # Request/Response models
@@ -633,7 +640,7 @@ Assessment completed using clinical decision support tools and medical knowledge
     
     try:
         response = model.generate_content(prompt)
-        assessment = response.text.strip()
+        assessment = clean_markdown(response.text.strip())
         
         # Mark session as completed
         # session.completed = True
@@ -734,12 +741,7 @@ Provide an accurate, concise answer based on the context above.
 
 import re
 
-def clean_markdown(text: str) -> str:
-    # Remove bold (**text** or __text__) and italics (*text* or _text_)
-    # Handles multiline bold/italics as well
-    text = re.sub(r"(\*\*|__)(.*?)\1", r"\2", text, flags=re.DOTALL)
-    text = re.sub(r"(\*|_)(.*?)\1", r"\2", text, flags=re.DOTALL)
-    return text
+
 
 
 # Simple chat endpoint (existing functionality)
